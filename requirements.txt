@@ -1,7 +1,5 @@
 Flask
 requests
-pandas
-pandas-ta==0.3.14b0
-python-dotenv
+
 
 
