@@ -1,5 +1,5 @@
 Flask
 requests
 pandas
-pandas_ta
 python-dotenv
+
