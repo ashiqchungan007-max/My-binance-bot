@@ -8,6 +8,8 @@ import urllib.parse
 from datetime import datetime, timezone
 from flask import Flask
 import requests
+import pandas as pd
+import pandas_ta as ta
 
 # ===================================================
 # DUMMY WEB SERVER (FOR RENDER / REPLIT)
@@ -16,13 +18,13 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "XAUUSDT High-Volume Session Bot is Running Safely on REAL ACCOUNT!"
+    return "XAUUSDT High-Volume Session Bot (Optimized v2) is Running Safely on REAL ACCOUNT!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# Self-Ping to prevent Render from sleeping
+# Self-Ping to prevent Render from sleeping (Pinged every 5 minutes)
 def keep_alive():
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if render_url:
@@ -32,7 +34,7 @@ def keep_alive():
                 print("\n Keep-alive ping sent to server.")
             except Exception as e:
                 print(f"\nPing Error: {e}")
-            time.sleep(600)  # Every 10 minutes
+            time.sleep(300)  # Every 5 minutes
 
 # ===================================================
 # API KEYS & CONFIGURATION (REAL ACCOUNT SETTINGS)
@@ -61,6 +63,7 @@ BE_ATR_MULTIPLIER = 2.0  # Break-Even trigger set to 2.0x ATR
 BREAKOUT_BUFFER_PERCENT = 0.001  # 0.1% Price Buffer
 ADX_THRESHOLD = 25
 DONCHIAN_PERIOD = 20
+VOLUME_MULTIPLIER = 1.3  # Balanced volume spike filter to avoid fakeouts
 
 # SESSION TIME FILTER (UTC) - London & New York Active Trading Hours
 SESSION_START_HOUR_UTC = 7   # 07:00 UTC (12:30 PM IST)
@@ -168,23 +171,35 @@ def get_position_info(symbol):
                 return float(pos['positionAmt']), float(pos['entryPrice'])
     return None, 0.0
 
-def check_if_sl_is_at_breakeven(symbol, entry_price):
+def get_open_stop_orders(symbol):
     path = "/fapi/v1/openOrders"
     res = send_signed_request("GET", path, {"symbol": symbol})
+    open_sl_orders = []
     if res and isinstance(res, list):
         for order in res:
-            if order.get("type") == "STOP_MARKET":
-                stop_price = float(order.get("stopPrice", 0.0))
-                if abs(stop_price - entry_price) < (TICK_SIZE * 5):
-                    return True
+            if order.get("type") in ["STOP_MARKET", "STOP"]:
+                open_sl_orders.append(order)
+    return open_sl_orders
+
+def check_if_sl_is_at_breakeven(symbol, entry_price):
+    open_sl_orders = get_open_stop_orders(symbol)
+    for order in open_sl_orders:
+        stop_price = float(order.get("stopPrice", 0.0))
+        if abs(stop_price - entry_price) < (TICK_SIZE * 5):
+            return True
     return False
 
 # ===================================================
-# ORDERS & BREAK-EVEN SYSTEM
+# ORDERS & SAFE BREAK-EVEN SYSTEM
 # ===================================================
 def cancel_all_orders(symbol):
     path = "/fapi/v1/allOpenOrders"
     payload = {"symbol": symbol}
+    return send_signed_request("DELETE", path, payload)
+
+def cancel_single_order(symbol, order_id):
+    path = "/fapi/v1/order"
+    payload = {"symbol": symbol, "orderId": order_id}
     return send_signed_request("DELETE", path, payload)
 
 def emergency_close_position(symbol, current_position_side, quantity):
@@ -249,7 +264,11 @@ def place_stop_loss_and_take_profit(symbol, exit_side, sl_price, tp_price, qty):
         return False
     return True
 
-def update_break_even_sl(symbol, exit_side, entry_price, tp_price, qty, current_price):
+def safe_update_break_even_sl(symbol, exit_side, entry_price, current_price):
+    """
+    Safely updates SL to Break-Even WITHOUT leaving the position unprotected.
+    It places the new Break-Even SL FIRST, verifies success, and only then cancels the old SL.
+    """
     min_dist = TICK_SIZE * 10
     if exit_side == "SELL" and (current_price - entry_price) < min_dist:
         notify("BE WARNING", "Price too close to Entry. Skipping Break-Even update for safety.")
@@ -258,114 +277,84 @@ def update_break_even_sl(symbol, exit_side, entry_price, tp_price, qty, current_
         notify("BE WARNING", "Price too close to Entry. Skipping Break-Even update for safety.")
         return False
 
-    return place_stop_loss_and_take_profit(symbol, exit_side, entry_price, tp_price, qty)
+    sl_str = f"{round_step(entry_price, TICK_SIZE)}"
+    path = "/fapi/v1/order"
+    
+    new_sl_payload = {
+        "symbol": symbol,
+        "side": exit_side,
+        "type": "STOP_MARKET",
+        "stopPrice": sl_str,
+        "closePosition": "true"
+    }
+
+    # Step 1: Get existing SL orders before placing new one
+    old_sl_orders = get_open_stop_orders(symbol)
+
+    # Step 2: Place NEW Break-Even SL order FIRST
+    new_sl_res = send_signed_request("POST", path, new_sl_payload)
+
+    if new_sl_res and 'orderId' in new_sl_res:
+        # Step 3: Only after new SL is confirmed active, cancel old SL orders
+        for old_order in old_sl_orders:
+            cancel_single_order(symbol, old_order['orderId'])
+        return True
+    else:
+        notify("BE ERROR", "Failed to place new Break-Even SL! Retaining old Stop Loss for safety.")
+        return False
 
 # ===================================================
-# KLINES & INDICATORS
+# FAST INDICATORS (USING PANDAS-TA)
 # ===================================================
-def get_klines_data(symbol, interval, limit=250):
+def get_klines_df(symbol, interval, limit=250):
     try:
         url = f"{BASE_URL}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
             data = res.json()
-            timestamps = [int(candle[0]) for candle in data]
-            closes = [float(candle[4]) for candle in data]
-            highs = [float(candle[2]) for candle in data]
-            lows = [float(candle[3]) for candle in data]
-            volumes = [float(candle[5]) for candle in data]
-            return timestamps, closes, highs, lows, volumes
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_vol', 'trades', 'tb_base_vol', 'tb_quote_vol', 'ignore'
+            ])
+            df['timestamp'] = pd.to_numeric(df['timestamp'])
+            df['close'] = pd.to_numeric(df['close'])
+            df['high'] = pd.to_numeric(df['high'])
+            df['low'] = pd.to_numeric(df['low'])
+            df['volume'] = pd.to_numeric(df['volume'])
+            return df
     except Exception as e:
         print(f"Candle Fetch Error ({interval}): {e}")
-    return None, None, None, None, None
+    return None
 
-def calculate_ema(prices, period):
-    if len(prices) < period: return 0.0
-    k = 2 / (period + 1)
-    ema = sum(prices[:period]) / period
-    for price in prices[period:]:
-        ema = (price * k) + (ema * (1 - k))
-    return ema
+def calculate_fast_indicators(df_15m, df_1h):
+    """Calculates EMA, ATR, ADX, Stoch RSI using pandas-ta for high-performance processing."""
+    # 15m Indicators
+    df_15m['ema200'] = ta.ema(df_15m['close'], length=200)
+    df_15m['atr'] = ta.atr(df_15m['high'], df_15m['low'], df_15m['close'], length=ATR_PERIOD)
+    
+    adx_df = ta.adx(df_15m['high'], df_15m['low'], df_15m['close'], length=ATR_PERIOD)
+    if adx_df is not None and f'ADX_{ATR_PERIOD}' in adx_df.columns:
+        df_15m['adx'] = adx_df[f'ADX_{ATR_PERIOD}']
+    else:
+        df_15m['adx'] = 0.0
 
-def _wilders_rma(values, period):
-    if len(values) < period: return [0.0] * len(values)
-    rma = [sum(values[:period]) / period]
-    for val in values[period:]:
-        new_rma = (rma[-1] * (period - 1) + val) / period
-        rma.append(new_rma)
-    return rma
+    stoch_rsi_df = ta.stochrsi(df_15m['close'], length=14, rsi_length=14, k=3, d=3)
+    if stoch_rsi_df is not None and 'STOCHRSIk_14_14_3_3' in stoch_rsi_df.columns:
+        df_15m['stoch_rsi'] = stoch_rsi_df['STOCHRSIk_14_14_3_3']
+    else:
+        df_15m['stoch_rsi'] = 50.0
 
-def calculate_atr(highs, lows, closes, period=14):
-    if len(closes) <= period: return 2.0
-    tr_list = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-        tr_list.append(tr)
-    atr_series = _wilders_rma(tr_list, period)
-    return atr_series[-1]
+    # 1h Macro EMA
+    df_1h['ema200'] = ta.ema(df_1h['close'], length=200)
 
-def calculate_adx(highs, lows, closes, period=14):
-    if len(closes) <= (period * 2): return 0.0
-    tr_list, pdm_list, mdm_list = [], [], []
-    for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-        tr_list.append(tr)
-        up_move = highs[i] - highs[i-1]
-        down_move = lows[i-1] - lows[i]
-        pdm = up_move if (up_move > down_move and up_move > 0) else 0.0
-        mdm = down_move if (down_move > up_move and down_move > 0) else 0.0
-        pdm_list.append(pdm)
-        mdm_list.append(mdm)
-
-    tr_rma = _wilders_rma(tr_list, period)
-    pdm_rma = _wilders_rma(pdm_list, period)
-    mdm_rma = _wilders_rma(mdm_list, period)
-
-    dx_list = []
-    for i in range(len(tr_rma)):
-        if tr_rma[i] == 0: continue
-        pdi = (pdm_rma[i] / tr_rma[i]) * 100
-        mdi = (mdm_rma[i] / tr_rma[i]) * 100
-        di_sum = pdi + mdi
-        dx = (abs(pdi - mdi) / di_sum * 100) if di_sum != 0 else 0.0
-        dx_list.append(dx)
-
-    if len(dx_list) < period: return 0.0
-    adx_rma = _wilders_rma(dx_list, period)
-    return adx_rma[-1]
-
-def calculate_stoch_rsi(closes, period=14, stoch_period=14):
-    if len(closes) < (period + stoch_period + 5): return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i-1]
-        gains.append(max(change, 0.0))
-        losses.append(abs(min(change, 0.0)))
-
-    avg_gains = _wilders_rma(gains, period)
-    avg_losses = _wilders_rma(losses, period)
-
-    rsi_list = []
-    for i in range(len(avg_gains)):
-        if avg_losses[i] == 0:
-            rsi_list.append(100.0)
-        else:
-            rs = avg_gains[i] / avg_losses[i]
-            rsi_list.append(100.0 - (100.0 / (1.0 + rs)))
-
-    if len(rsi_list) < stoch_period: return 50.0
-    recent_rsi = rsi_list[-stoch_period:]
-    min_rsi, max_rsi = min(recent_rsi), max(recent_rsi)
-    if max_rsi == min_rsi: return 50.0
-
-    return ((rsi_list[-1] - min_rsi) / (max_rsi - min_rsi)) * 100.0
+    return df_15m, df_1h
 
 # ===================================================
 # BOT MAIN LOOP
 # ===================================================
 def bot_loop():
     global TICK_SIZE, STEP_SIZE
-    notify("System Startup", f"Real Account Bot initialized for {SYMBOL} ({CANDLE_TIMEFRAME}) | Fixed Qty: {QUANTITY}")
+    notify("System Startup", f"Real Account Bot (Optimized v2) initialized for {SYMBOL} ({CANDLE_TIMEFRAME}) | Qty: {QUANTITY}")
     
     ensure_one_way_mode()
     set_leverage(SYMBOL, LEVERAGE)
@@ -390,28 +379,34 @@ def bot_loop():
             if actual_pos != 0:
                 was_in_position = True
 
-            timestamps, closes, highs, lows, volumes = get_klines_data(SYMBOL, CANDLE_TIMEFRAME, limit=250)
-            _, macro_closes, _, _, _ = get_klines_data(SYMBOL, MACRO_TIMEFRAME, limit=250)
+            df_15m = get_klines_df(SYMBOL, CANDLE_TIMEFRAME, limit=250)
+            df_1h = get_klines_df(SYMBOL, MACRO_TIMEFRAME, limit=250)
 
-            if closes and len(closes) >= 200 and macro_closes and len(macro_closes) >= 200:
-                current_candle_time = timestamps[-2]
-                last_closed_price = closes[-2]
-                current_price = closes[-1]
+            if df_15m is not None and len(df_15m) >= 200 and df_1h is not None and len(df_1h) >= 200:
+                df_15m, df_1h = calculate_fast_indicators(df_15m, df_1h)
 
-                # Indicators
-                ema_200_15m = calculate_ema(closes[:-1], 200)
-                ema_200_1h = calculate_ema(macro_closes[:-1], 200)
+                # Fetch closed candle values (index -2) and current live price (index -1)
+                closed_candle = df_15m.iloc[-2]
+                live_candle = df_15m.iloc[-1]
+                macro_closed_candle = df_1h.iloc[-2]
+
+                current_candle_time = int(closed_candle['timestamp'])
+                last_closed_price = float(closed_candle['close'])
+                current_price = float(live_candle['close'])
+
+                ema_200_15m = float(closed_candle['ema200']) if not pd.isna(closed_candle['ema200']) else 0.0
+                ema_200_1h = float(macro_closed_candle['ema200']) if not pd.isna(macro_closed_candle['ema200']) else 0.0
                 
-                adx_val = calculate_adx(highs[:-1], lows[:-1], closes[:-1], ATR_PERIOD)
-                stoch_rsi = calculate_stoch_rsi(closes[:-1])
-                atr_val = calculate_atr(highs[:-1], lows[:-1], closes[:-1], ATR_PERIOD)
+                adx_val = float(closed_candle['adx']) if not pd.isna(closed_candle['adx']) else 0.0
+                stoch_rsi = float(closed_candle['stoch_rsi']) if not pd.isna(closed_candle['stoch_rsi']) else 50.0
+                atr_val = float(closed_candle['atr']) if not pd.isna(closed_candle['atr']) else 2.0
 
-                last_vol = volumes[-2]
-                vol_ma = sum(volumes[-21:-1]) / 20
+                last_vol = float(closed_candle['volume'])
+                vol_ma = float(df_15m['volume'].iloc[-22:-1].mean())
 
-                # Donchian calculation
-                donchian_high = max(highs[-(DONCHIAN_PERIOD + 1): -1])
-                donchian_low = min(lows[-(DONCHIAN_PERIOD + 1): -1])
+                # Donchian calculation on completed closed candles
+                donchian_high = float(df_15m['high'].iloc[-(DONCHIAN_PERIOD + 1): -1].max())
+                donchian_low = float(df_15m['low'].iloc[-(DONCHIAN_PERIOD + 1): -1].min())
 
                 # Price Buffer for Donchian Levels
                 donchian_high_buffered = donchian_high * (1 + BREAKOUT_BUFFER_PERCENT)
@@ -420,7 +415,7 @@ def bot_loop():
                 session_active = is_high_volume_session()
                 print(f"Price: ${current_price:,.2f} | ADX: {adx_val:.1f} | Active Session: {session_active} | Active Qty: {actual_pos}", end="\r")
 
-                # BREAK-EVEN STOP LOSS MANAGEMENT
+                # SAFE BREAK-EVEN STOP LOSS MANAGEMENT
                 if actual_pos != 0 and current_entry_price > 0:
                     is_sl_moved_to_be = check_if_sl_is_at_breakeven(SYMBOL, current_entry_price)
                     
@@ -428,22 +423,20 @@ def bot_loop():
                         profit_distance = (current_price - current_entry_price) if actual_pos > 0 else (current_entry_price - current_price)
                         if profit_distance >= (atr_val * BE_ATR_MULTIPLIER):
                             close_side = "SELL" if actual_pos > 0 else "BUY"
-                            new_tp = current_entry_price + (atr_val * ATR_TP_MULTIPLIER) if actual_pos > 0 else current_entry_price - (atr_val * ATR_TP_MULTIPLIER)
                             
-                            success = update_break_even_sl(
+                            success = safe_update_break_even_sl(
                                 SYMBOL, 
                                 close_side, 
                                 current_entry_price, 
-                                new_tp, 
-                                abs(actual_pos),
                                 current_price
                             )
                             if success:
-                                notify("Risk Update", f"Profit target {BE_ATR_MULTIPLIER}x ATR reached! SL moved to Break-Even safely.")
+                                notify("Risk Update", f"Profit target {BE_ATR_MULTIPLIER}x ATR reached! SL moved to Break-Even safely (Zero Risk).")
 
-                # ENTRY CONDITIONS WITH SESSION FILTER
+                # ENTRY CONDITIONS WITH SESSION & VOLUME FILTER
                 if actual_pos == 0 and adx_val >= ADX_THRESHOLD and last_traded_candle_time != current_candle_time:
-                    if session_active and last_vol > vol_ma:
+                    # Optimized Volume Spike Filter (1.3x average volume)
+                    if session_active and last_vol > (vol_ma * VOLUME_MULTIPLIER):
                         sl_distance = atr_val * ATR_SL_MULTIPLIER
                         tp_distance = atr_val * ATR_TP_MULTIPLIER
 
