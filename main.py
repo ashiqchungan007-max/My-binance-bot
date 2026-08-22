@@ -7,6 +7,8 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 from flask import Flask
+import pandas as pd
+import pandas_ta as ta
 import requests
 
 # ===================================================
@@ -46,8 +48,8 @@ USE_TESTNET = False  # Set to False for Real Live Account
 SYMBOL = "XAUUSDT"
 BASE_URL = "https://fapi.binance.com"  # Real Account Futures Endpoint
 
-LEVERAGE = 5
-QUANTITY = 0.01  # Safe minimum lot size for XAUUSDT
+LEVERAGE = 40
+QUANTITY = 0.005  # Safe minimum lot size for XAUUSDT
 
 CANDLE_TIMEFRAME = "15m"
 MACRO_TIMEFRAME = "1h"
@@ -261,104 +263,27 @@ def update_break_even_sl(symbol, exit_side, entry_price, tp_price, qty, current_
     return place_stop_loss_and_take_profit(symbol, exit_side, entry_price, tp_price, qty)
 
 # ===================================================
-# KLINES & INDICATORS
+# KLINES & PANDAS DATAFRAME
 # ===================================================
-def get_klines_data(symbol, interval, limit=250):
+def get_klines_df(symbol, interval, limit=250):
     try:
         url = f"{BASE_URL}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
             data = res.json()
-            timestamps = [int(candle[0]) for candle in data]
-            closes = [float(candle[4]) for candle in data]
-            highs = [float(candle[2]) for candle in data]
-            lows = [float(candle[3]) for candle in data]
-            volumes = [float(candle[5]) for candle in data]
-            return timestamps, closes, highs, lows, volumes
+            cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 
+                    'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore']
+            df = pd.DataFrame(data, columns=cols)
+            
+            # Convert string values to float
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+            df['close'] = df['close'].astype(float)
+            df['volume'] = df['volume'].astype(float)
+            return df
     except Exception as e:
         print(f"Candle Fetch Error ({interval}): {e}")
-    return None, None, None, None, None
-
-def calculate_ema(prices, period):
-    if len(prices) < period: return 0.0
-    k = 2 / (period + 1)
-    ema = sum(prices[:period]) / period
-    for price in prices[period:]:
-        ema = (price * k) + (ema * (1 - k))
-    return ema
-
-def _wilders_rma(values, period):
-    if len(values) < period: return [0.0] * len(values)
-    rma = [sum(values[:period]) / period]
-    for val in values[period:]:
-        new_rma = (rma[-1] * (period - 1) + val) / period
-        rma.append(new_rma)
-    return rma
-
-def calculate_atr(highs, lows, closes, period=14):
-    if len(closes) <= period: return 2.0
-    tr_list = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-        tr_list.append(tr)
-    atr_series = _wilders_rma(tr_list, period)
-    return atr_series[-1]
-
-def calculate_adx(highs, lows, closes, period=14):
-    if len(closes) <= (period * 2): return 0.0
-    tr_list, pdm_list, mdm_list = [], [], []
-    for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-        tr_list.append(tr)
-        up_move = highs[i] - highs[i-1]
-        down_move = lows[i-1] - lows[i]
-        pdm = up_move if (up_move > down_move and up_move > 0) else 0.0
-        mdm = down_move if (down_move > up_move and down_move > 0) else 0.0
-        pdm_list.append(pdm)
-        mdm_list.append(mdm)
-
-    tr_rma = _wilders_rma(tr_list, period)
-    pdm_rma = _wilders_rma(pdm_list, period)
-    mdm_rma = _wilders_rma(mdm_list, period)
-
-    dx_list = []
-    for i in range(len(tr_rma)):
-        if tr_rma[i] == 0: continue
-        pdi = (pdm_rma[i] / tr_rma[i]) * 100
-        mdi = (mdm_rma[i] / tr_rma[i]) * 100
-        di_sum = pdi + mdi
-        dx = (abs(pdi - mdi) / di_sum * 100) if di_sum != 0 else 0.0
-        dx_list.append(dx)
-
-    if len(dx_list) < period: return 0.0
-    adx_rma = _wilders_rma(dx_list, period)
-    return adx_rma[-1]
-
-def calculate_stoch_rsi(closes, period=14, stoch_period=14):
-    if len(closes) < (period + stoch_period + 5): return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i-1]
-        gains.append(max(change, 0.0))
-        losses.append(abs(min(change, 0.0)))
-
-    avg_gains = _wilders_rma(gains, period)
-    avg_losses = _wilders_rma(losses, period)
-
-    rsi_list = []
-    for i in range(len(avg_gains)):
-        if avg_losses[i] == 0:
-            rsi_list.append(100.0)
-        else:
-            rs = avg_gains[i] / avg_losses[i]
-            rsi_list.append(100.0 - (100.0 / (1.0 + rs)))
-
-    if len(rsi_list) < stoch_period: return 50.0
-    recent_rsi = rsi_list[-stoch_period:]
-    min_rsi, max_rsi = min(recent_rsi), max(recent_rsi)
-    if max_rsi == min_rsi: return 50.0
-
-    return ((rsi_list[-1] - min_rsi) / (max_rsi - min_rsi)) * 100.0
+    return None
 
 # ===================================================
 # BOT MAIN LOOP
@@ -390,28 +315,50 @@ def bot_loop():
             if actual_pos != 0:
                 was_in_position = True
 
-            timestamps, closes, highs, lows, volumes = get_klines_data(SYMBOL, CANDLE_TIMEFRAME, limit=250)
-            _, macro_closes, _, _, _ = get_klines_data(SYMBOL, MACRO_TIMEFRAME, limit=250)
+            # Fetch DataFrame using Pandas
+            df_15m = get_klines_df(SYMBOL, CANDLE_TIMEFRAME, limit=250)
+            df_1h = get_klines_df(SYMBOL, MACRO_TIMEFRAME, limit=250)
 
-            if closes and len(closes) >= 200 and macro_closes and len(macro_closes) >= 200:
-                current_candle_time = timestamps[-2]
-                last_closed_price = closes[-2]
-                current_price = closes[-1]
+            if df_15m is not None and len(df_15m) >= 200 and df_1h is not None and len(df_1h) >= 200:
+                # 1. EMAs
+                df_15m['ema_200'] = ta.ema(df_15m['close'], length=200)
+                df_1h['ema_200'] = ta.ema(df_1h['close'], length=200)
 
-                # Indicators
-                ema_200_15m = calculate_ema(closes[:-1], 200)
-                ema_200_1h = calculate_ema(macro_closes[:-1], 200)
-                
-                adx_val = calculate_adx(highs[:-1], lows[:-1], closes[:-1], ATR_PERIOD)
-                stoch_rsi = calculate_stoch_rsi(closes[:-1])
-                atr_val = calculate_atr(highs[:-1], lows[:-1], closes[:-1], ATR_PERIOD)
+                # 2. ATR
+                df_15m['atr'] = ta.atr(df_15m['high'], df_15m['low'], df_15m['close'], length=ATR_PERIOD)
 
-                last_vol = volumes[-2]
-                vol_ma = sum(volumes[-21:-1]) / 20
+                # 3. ADX
+                adx_df = ta.adx(df_15m['high'], df_15m['low'], df_15m['close'], length=ATR_PERIOD)
+                df_15m['adx'] = adx_df[f'ADX_{ATR_PERIOD}']
 
-                # Donchian calculation
-                donchian_high = max(highs[-(DONCHIAN_PERIOD + 1): -1])
-                donchian_low = min(lows[-(DONCHIAN_PERIOD + 1): -1])
+                # 4. Stoch RSI
+                stoch_rsi_df = ta.stochrsi(df_15m['close'], length=14, rsi_length=14, k=3, d=3)
+                df_15m['stoch_rsi'] = stoch_rsi_df['STOCHRSIk_14_14_3_3']
+
+                # 5. Volume MA
+                df_15m['vol_ma'] = ta.sma(df_15m['volume'], length=20)
+
+                # 6. Donchian Channel
+                donchian_df = ta.donchian(df_15m['high'], df_15m['low'], lower_length=DONCHIAN_PERIOD, upper_length=DONCHIAN_PERIOD)
+                df_15m['donchian_high'] = donchian_df[f'DCU_{DONCHIAN_PERIOD}_{DONCHIAN_PERIOD}']
+                df_15m['donchian_low'] = donchian_df[f'DCL_{DONCHIAN_PERIOD}_{DONCHIAN_PERIOD}']
+
+                # Values for closed candle (iloc[-2]) and active candle (iloc[-1])
+                current_candle_time = df_15m['timestamp'].iloc[-2]
+                last_closed_price = df_15m['close'].iloc[-2]
+                current_price = df_15m['close'].iloc[-1]
+
+                ema_200_15m = df_15m['ema_200'].iloc[-2]
+                ema_200_1h = df_1h['ema_200'].iloc[-2]
+                adx_val = df_15m['adx'].iloc[-2]
+                stoch_rsi = df_15m['stoch_rsi'].iloc[-2]
+                atr_val = df_15m['atr'].iloc[-2]
+
+                last_vol = df_15m['volume'].iloc[-2]
+                vol_ma = df_15m['vol_ma'].iloc[-2]
+
+                donchian_high = df_15m['donchian_high'].iloc[-2]
+                donchian_low = df_15m['donchian_low'].iloc[-2]
 
                 # Price Buffer for Donchian Levels
                 donchian_high_buffered = donchian_high * (1 + BREAKOUT_BUFFER_PERCENT)
