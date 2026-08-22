@@ -1,7 +1,5 @@
 flask
 requests
-pandas
-pandas-ta
 
 
 
