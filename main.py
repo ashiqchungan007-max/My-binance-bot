@@ -46,8 +46,8 @@ USE_TESTNET = False  # Set to False for Real Live Account
 SYMBOL = "XAUUSDT"
 BASE_URL = "https://fapi.binance.com"  # Real Account Futures Endpoint
 
-LEVERAGE = 5
-QUANTITY = 0.01  # Safe minimum lot size for XAUUSDT
+LEVERAGE = 50
+QUANTITY = 0.005  # Safe minimum lot size for XAUUSDT
 
 CANDLE_TIMEFRAME = "15m"
 MACRO_TIMEFRAME = "1h"
