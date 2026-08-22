@@ -12,29 +12,32 @@ import pandas_ta as ta
 import requests
 
 # ===================================================
-# DUMMY WEB SERVER (FOR RENDER / REPLIT)
+# WEB SERVER & KEEP-ALIVE (FOR RENDER 24/7 LIVE)
 # ===================================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "XAUUSDT High-Volume Session Bot is Running Safely on REAL ACCOUNT!"
+    return "XAUUSDT High-Volume Session Bot is Running Safely on REAL ACCOUNT!", 200
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# Self-Ping to prevent Render from sleeping
 def keep_alive():
+    """Self-Ping mechanism to prevent Render free instances from sleeping."""
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if render_url:
+        print(f"🔄 Keep-Alive service started for: {render_url}")
         while True:
+            time.sleep(600)  # Ping every 10 minutes
             try:
-                requests.get(render_url, timeout=10)
-                print("\n Keep-alive ping sent to server.")
+                res = requests.get(render_url, timeout=10)
+                print(f"\n🟢 Keep-alive ping sent to server. Status Code: {res.status_code}")
             except Exception as e:
-                print(f"\nPing Error: {e}")
-            time.sleep(600)  # Every 10 minutes
+                print(f"\n🔴 Keep-alive Ping Error: {e}")
+    else:
+        print("⚠️ Warning: RENDER_EXTERNAL_URL is not set in Environment Variables.")
 
 # ===================================================
 # API KEYS & CONFIGURATION (REAL ACCOUNT SETTINGS)
@@ -65,8 +68,8 @@ ADX_THRESHOLD = 25
 DONCHIAN_PERIOD = 20
 
 # SESSION TIME FILTER (UTC) - London & New York Active Trading Hours
-SESSION_START_HOUR_UTC = 7   # 07:00 UTC (12:30 PM IST)
-SESSION_END_HOUR_UTC = 21    # 21:00 UTC (02:30 AM IST)
+SESSION_START_HOUR_UTC = 7   # 07:00 UTC
+SESSION_END_HOUR_UTC = 21    # 21:00 UTC
 
 def notify(title, message):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -433,13 +436,17 @@ def bot_loop():
 
         time.sleep(POLL_INTERVAL)
 
+# ===================================================
+# MAIN EXECUTION THREADS
+# ===================================================
 if __name__ == "__main__":
-    t = threading.Thread(target=bot_loop)
-    t.daemon = True
-    t.start()
+    # 1. Trading Bot Loop Thread
+    t_bot = threading.Thread(target=bot_loop, daemon=True)
+    t_bot.start()
     
-    t_ping = threading.Thread(target=keep_alive)
-    t_ping.daemon = True
+    # 2. Keep-Alive Self-Ping Thread
+    t_ping = threading.Thread(target=keep_alive, daemon=True)
     t_ping.start()
     
+    # 3. Flask Web Server (Primary Thread)
     run_web_server()
