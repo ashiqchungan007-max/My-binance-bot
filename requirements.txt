@@ -1,5 +1,7 @@
-Flask
+flask
 requests
+pandas
+pandas_ta
 
 
 
