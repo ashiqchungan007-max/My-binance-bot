@@ -46,8 +46,9 @@ USE_TESTNET = False  # Set to False for Real Live Account
 SYMBOL = "XAUUSDT"
 BASE_URL = "https://fapi.binance.com"  # Real Account Futures Endpoint
 
-LEVERAGE = 30
-QUANTITY = 0.005  # Safe minimum lot size for XAUUSDT
+# MODIFIED: Reduced leverage to 20x for safety against market spikes
+LEVERAGE = 20
+QUANTITY = 0.003  # Safe minimum lot size for XAUUSDT
 
 CANDLE_TIMEFRAME = "15m"
 MACRO_TIMEFRAME = "1h"
@@ -71,8 +72,11 @@ def notify(title, message):
     print(f"\n[{current_time}] 🔔 {title}: {message}")
 
 def is_high_volume_session():
-    """Checks if current UTC time falls within London / New York high-volume hours."""
+    """Checks if current UTC time falls within London / New York high-volume hours on weekdays."""
     now_utc = datetime.now(timezone.utc)
+    # MODIFIED: Weekend filter added (Saturday = 5, Sunday = 6)
+    if now_utc.weekday() in [5, 6]:
+        return False
     return SESSION_START_HOUR_UTC <= now_utc.hour < SESSION_END_HOUR_UTC
 
 def send_signed_request(http_method, url_path, payload=None):
@@ -393,7 +397,10 @@ def bot_loop():
             timestamps, closes, highs, lows, volumes = get_klines_data(SYMBOL, CANDLE_TIMEFRAME, limit=250)
             _, macro_closes, _, _, _ = get_klines_data(SYMBOL, MACRO_TIMEFRAME, limit=250)
 
-            if closes and len(closes) >= 200 and macro_closes and len(macro_closes) >= 200:
+            # MODIFIED: Robust data safety check to prevent loop crashes
+            if (closes is not None and macro_closes is not None and 
+                len(closes) >= 200 and len(macro_closes) >= 200):
+                
                 current_candle_time = timestamps[-2]
                 last_closed_price = closes[-2]
                 current_price = closes[-1]
@@ -454,7 +461,7 @@ def bot_loop():
 
                             if order and 'orderId' in order:
                                 last_traded_candle_time = current_candle_time
-                                time.sleep(1.5)
+                                time.sleep(2.5)  # MODIFIED: Increased delay for API position state sync
                                 _, real_entry = get_position_info(SYMBOL)
                                 entry = real_entry if real_entry > 0 else (avg_price if avg_price > 0 else current_price)
                                 
@@ -471,7 +478,7 @@ def bot_loop():
 
                             if order and 'orderId' in order:
                                 last_traded_candle_time = current_candle_time
-                                time.sleep(1.5)
+                                time.sleep(2.5)  # MODIFIED: Increased delay for API position state sync
                                 _, real_entry = get_position_info(SYMBOL)
                                 entry = real_entry if real_entry > 0 else (avg_price if avg_price > 0 else current_price)
 
