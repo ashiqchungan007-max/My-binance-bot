@@ -16,7 +16,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "XAUUSDT High-Volume Session Bot with Telegram Notifications is Running!"
+    return "XAUUSDT High-Volume Session Bot with Telegram Notifications & Controls is Running!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
@@ -50,9 +50,8 @@ USE_TESTNET = False
 SYMBOL = "XAUUSDT"
 BASE_URL = "https://fapi.binance.com"  # Real Account Futures Endpoint
 
-# MODIFIED: Reduced leverage to 5x for safe account management
-LEVERAGE = 20
-QUANTITY = 0.005  # Minimum safe quantity for XAUUSDT
+LEVERAGE = 20  # Set to your preferred leverage
+QUANTITY = 0.003  # Minimum safe quantity for XAUUSDT
 
 CANDLE_TIMEFRAME = "15m"
 MACRO_TIMEFRAME = "1h"
@@ -68,9 +67,16 @@ ADX_THRESHOLD = 25
 DONCHIAN_PERIOD = 20
 
 # SESSION TIME FILTER (UTC) - London & New York Active Trading Hours
-SESSION_START_HOUR_UTC = 7   # 07:00 UTC (12:30 PM IST)
-SESSION_END_HOUR_UTC = 21    # 21:00 UTC (02:30 AM IST)
+SESSION_START_HOUR_UTC = 7   # 07:00 UTC
+SESSION_END_HOUR_UTC = 21    # 21:00 UTC
 
+# GLOBAL CONTROL FLAGS FOR NEWS PAUSE SYSTEM
+BOT_PAUSED = False
+LAST_UPDATE_ID = 0
+
+# ===================================================
+# TELEGRAM FUNCTIONS & COMMAND CONTROL
+# ===================================================
 def notify(title, message):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     formatted_msg = f"[{current_time}]\n🔔 *{title}*\n{message}"
@@ -91,6 +97,41 @@ def notify(title, message):
         except Exception as e:
             print(f"Telegram Send Error: {e}")
 
+def check_telegram_commands():
+    """Listens for Telegram commands (/pause, /resume, /status) to control the bot."""
+    global BOT_PAUSED, LAST_UPDATE_ID
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        params = {"offset": LAST_UPDATE_ID + 1, "timeout": 2}
+        res = requests.get(url, params=params, timeout=5).json()
+
+        if res.get("ok") and res.get("result"):
+            for update in res["result"]:
+                LAST_UPDATE_ID = update["update_id"]
+                message = update.get("message", {})
+                text = message.get("text", "").strip().lower()
+                chat_id = str(message.get("chat", {}).get("id", ""))
+
+                # Security Check: Only process commands from your Telegram Chat ID
+                if chat_id == str(TELEGRAM_CHAT_ID):
+                    if text == "/pause":
+                        BOT_PAUSED = True
+                        notify("PAUSED ⏸️", "Bot trading has been *PAUSED* for News/Safety.")
+                    elif text in ["/resume", "/start"]:
+                        BOT_PAUSED = False
+                        notify("RESUMED ▶️", "Bot trading has been *RESUMED*.")
+                    elif text == "/status":
+                        status_str = "PAUSED ⏸️" if BOT_PAUSED else "RUNNING 🟢"
+                        notify("STATUS 📊", f"Current Bot Status: *{status_str}*")
+    except Exception as e:
+        print(f"Telegram Command Check Error: {e}")
+
+# ===================================================
+# BINANCE UTILITIES & SIGNED REQUESTS
+# ===================================================
 def is_high_volume_session():
     """Checks if current UTC time falls within London / New York high-volume hours on weekdays."""
     now_utc = datetime.now(timezone.utc)
@@ -388,7 +429,7 @@ def calculate_stoch_rsi(closes, period=14, stoch_period=14):
 # ===================================================
 def bot_loop():
     global TICK_SIZE, STEP_SIZE
-    notify("SYSTEM STARTUP", f"Bot Initialized for {SYMBOL} ({CANDLE_TIMEFRAME}) | Leverage: {LEVERAGE}x | Qty: {QUANTITY}")
+    notify("SYSTEM STARTUP", f"Bot Initialized for {SYMBOL} ({CANDLE_TIMEFRAME}) | Leverage: {LEVERAGE}x | Qty: {QUANTITY}\n\n_Use /pause, /resume, or /status in Telegram to control the bot._")
     
     ensure_one_way_mode()
     set_leverage(SYMBOL, LEVERAGE)
@@ -399,6 +440,15 @@ def bot_loop():
 
     while True:
         try:
+            # 1. Telegram വഴി കമാൻഡുകൾ ഉണ്ടോ എന്ന് ചെക്ക് ചെയ്യുക (/pause, /resume, /status)
+            check_telegram_commands()
+
+            # 2. ബോട്ട് PAUSED ആണെങ്കിൽ പുതിയ അനാലിസിസിലേക്ക് കടക്കാതെ വെയിറ്റ് ചെയ്യും
+            if BOT_PAUSED:
+                print("Bot status: PAUSED (Waiting for /resume command...)", end="\r")
+                time.sleep(POLL_INTERVAL)
+                continue
+
             actual_pos, current_entry_price = get_position_info(SYMBOL)
 
             if actual_pos is None:
