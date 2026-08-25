@@ -51,7 +51,7 @@ SYMBOL = "XAUUSDT"
 BASE_URL = "https://fapi.binance.com"  # Real Account Futures Endpoint
 
 # MODIFIED: Reduced leverage to 5x for safe account management
-LEVERAGE = 5
+LEVERAGE = 20
 QUANTITY = 0.005  # Minimum safe quantity for XAUUSDT
 
 CANDLE_TIMEFRAME = "15m"
