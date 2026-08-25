@@ -16,7 +16,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "XAUUSDT High-Volume Session Bot is Running Safely on REAL ACCOUNT!"
+    return "XAUUSDT High-Volume Session Bot with Telegram Notifications is Running!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
@@ -40,15 +40,19 @@ def keep_alive():
 API_KEY = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_SECRET_KEY", "")
 
+# TELEGRAM CONFIGURATION
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 # Real Account Configuration
-USE_TESTNET = False  # Set to False for Real Live Account
+USE_TESTNET = False  
 
 SYMBOL = "XAUUSDT"
 BASE_URL = "https://fapi.binance.com"  # Real Account Futures Endpoint
 
-# MODIFIED: Reduced leverage to 20x for safety against market spikes
-LEVERAGE = 20
-QUANTITY = 0.003  # Safe minimum lot size for XAUUSDT
+# MODIFIED: Reduced leverage to 5x for safe account management
+LEVERAGE = 5
+QUANTITY = 0.005  # Minimum safe quantity for XAUUSDT
 
 CANDLE_TIMEFRAME = "15m"
 MACRO_TIMEFRAME = "1h"
@@ -58,8 +62,8 @@ POLL_INTERVAL = 10
 ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 1.5
 ATR_TP_MULTIPLIER = 3.0
-BE_ATR_MULTIPLIER = 2.0  # Break-Even trigger set to 2.0x ATR
-BREAKOUT_BUFFER_PERCENT = 0.001  # 0.1% Price Buffer
+BE_ATR_MULTIPLIER = 2.0  
+BREAKOUT_BUFFER_PERCENT = 0.001  
 ADX_THRESHOLD = 25
 DONCHIAN_PERIOD = 20
 
@@ -69,19 +73,34 @@ SESSION_END_HOUR_UTC = 21    # 21:00 UTC (02:30 AM IST)
 
 def notify(title, message):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\n[{current_time}] 🔔 {title}: {message}")
+    formatted_msg = f"[{current_time}]\n🔔 *{title}*\n{message}"
+    
+    # 1. Console Log
+    print(f"\n{formatted_msg}")
+    
+    # 2. Telegram Send
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": formatted_msg,
+                "parse_mode": "Markdown"
+            }
+            requests.post(url, json=payload, timeout=5)
+        except Exception as e:
+            print(f"Telegram Send Error: {e}")
 
 def is_high_volume_session():
     """Checks if current UTC time falls within London / New York high-volume hours on weekdays."""
     now_utc = datetime.now(timezone.utc)
-    # MODIFIED: Weekend filter added (Saturday = 5, Sunday = 6)
     if now_utc.weekday() in [5, 6]:
         return False
     return SESSION_START_HOUR_UTC <= now_utc.hour < SESSION_END_HOUR_UTC
 
 def send_signed_request(http_method, url_path, payload=None):
     if not API_KEY or not API_SECRET:
-        print("\n❌ ERROR: BINANCE_API_KEY or BINANCE_SECRET_KEY is missing in Environment Variables!")
+        print("\n❌ ERROR: BINANCE_API_KEY or BINANCE_SECRET_KEY is missing!")
         return None
 
     if payload is None:
@@ -201,7 +220,7 @@ def emergency_close_position(symbol, current_position_side, quantity):
         "quantity": f"{round_step(quantity, STEP_SIZE)}",
         "reduceOnly": "true"
     }
-    notify("EMERGENCY", f"Closing {current_position_side} position immediately with {close_side} order!")
+    notify("EMERGENCY CLOSE", f"Closing {current_position_side} position immediately with {close_side} order!")
     return send_signed_request("POST", path, payload)
 
 def place_futures_order(symbol, side, quantity):
@@ -256,10 +275,10 @@ def place_stop_loss_and_take_profit(symbol, exit_side, sl_price, tp_price, qty):
 def update_break_even_sl(symbol, exit_side, entry_price, tp_price, qty, current_price):
     min_dist = TICK_SIZE * 10
     if exit_side == "SELL" and (current_price - entry_price) < min_dist:
-        notify("BE WARNING", "Price too close to Entry. Skipping Break-Even update for safety.")
+        notify("BE WARNING", "Price too close to Entry. Skipping Break-Even update.")
         return False
     elif exit_side == "BUY" and (entry_price - current_price) < min_dist:
-        notify("BE WARNING", "Price too close to Entry. Skipping Break-Even update for safety.")
+        notify("BE WARNING", "Price too close to Entry. Skipping Break-Even update.")
         return False
 
     return place_stop_loss_and_take_profit(symbol, exit_side, entry_price, tp_price, qty)
@@ -369,7 +388,7 @@ def calculate_stoch_rsi(closes, period=14, stoch_period=14):
 # ===================================================
 def bot_loop():
     global TICK_SIZE, STEP_SIZE
-    notify("System Startup", f"Real Account Bot initialized for {SYMBOL} ({CANDLE_TIMEFRAME}) | Fixed Qty: {QUANTITY}")
+    notify("SYSTEM STARTUP", f"Bot Initialized for {SYMBOL} ({CANDLE_TIMEFRAME}) | Leverage: {LEVERAGE}x | Qty: {QUANTITY}")
     
     ensure_one_way_mode()
     set_leverage(SYMBOL, LEVERAGE)
@@ -388,7 +407,7 @@ def bot_loop():
 
             if actual_pos == 0 and was_in_position:
                 cancel_all_orders(SYMBOL)
-                notify("Position Cleanup", "Position closed. Cleaned up remaining SL/TP orders.")
+                notify("POSITION CLOSED", "Position closed via TP/SL. Orders cleaned up safely.")
                 was_in_position = False
 
             if actual_pos != 0:
@@ -397,7 +416,6 @@ def bot_loop():
             timestamps, closes, highs, lows, volumes = get_klines_data(SYMBOL, CANDLE_TIMEFRAME, limit=250)
             _, macro_closes, _, _, _ = get_klines_data(SYMBOL, MACRO_TIMEFRAME, limit=250)
 
-            # MODIFIED: Robust data safety check to prevent loop crashes
             if (closes is not None and macro_closes is not None and 
                 len(closes) >= 200 and len(macro_closes) >= 200):
                 
@@ -416,11 +434,10 @@ def bot_loop():
                 last_vol = volumes[-2]
                 vol_ma = sum(volumes[-21:-1]) / 20
 
-                # Donchian calculation
+                # Donchian Level System
                 donchian_high = max(highs[-(DONCHIAN_PERIOD + 1): -1])
                 donchian_low = min(lows[-(DONCHIAN_PERIOD + 1): -1])
 
-                # Price Buffer for Donchian Levels
                 donchian_high_buffered = donchian_high * (1 + BREAKOUT_BUFFER_PERCENT)
                 donchian_low_buffered = donchian_low * (1 - BREAKOUT_BUFFER_PERCENT)
 
@@ -446,7 +463,7 @@ def bot_loop():
                                 current_price
                             )
                             if success:
-                                notify("Risk Update", f"Profit target {BE_ATR_MULTIPLIER}x ATR reached! SL moved to Break-Even safely.")
+                                notify("RISK UPDATE", f"Profit target reached! SL moved to Break-Even (${current_entry_price:,.2f}) safely.")
 
                 # ENTRY CONDITIONS WITH SESSION FILTER
                 if actual_pos == 0 and adx_val >= ADX_THRESHOLD and last_traded_candle_time != current_candle_time:
@@ -456,12 +473,11 @@ def bot_loop():
 
                         # LONG ENTRY
                         if last_closed_price > donchian_high_buffered and last_closed_price > ema_200_15m and last_closed_price > ema_200_1h and stoch_rsi < 80:
-                            notify("Trade Signal", f"Active Session Bullish Breakout! Opening LONG Qty: {QUANTITY}...")
                             order, avg_price = place_futures_order(SYMBOL, "BUY", QUANTITY)
 
                             if order and 'orderId' in order:
                                 last_traded_candle_time = current_candle_time
-                                time.sleep(2.5)  # MODIFIED: Increased delay for API position state sync
+                                time.sleep(2.5)  
                                 _, real_entry = get_position_info(SYMBOL)
                                 entry = real_entry if real_entry > 0 else (avg_price if avg_price > 0 else current_price)
                                 
@@ -469,16 +485,15 @@ def bot_loop():
                                 tp_price = entry + tp_distance
 
                                 place_stop_loss_and_take_profit(SYMBOL, "SELL", sl_price, tp_price, QUANTITY)
-                                notify("LONG Executed", f"Entry: ${entry:,.2f} | SL: ${sl_price:,.2f} | TP: ${tp_price:,.2f}")
+                                notify("LONG EXECUTED", f"Entry: ${entry:,.2f}\nSL: ${sl_price:,.2f}\nTP: ${tp_price:,.2f}")
 
                         # SHORT ENTRY
                         elif last_closed_price < donchian_low_buffered and last_closed_price < ema_200_15m and last_closed_price < ema_200_1h and stoch_rsi > 20:
-                            notify("Trade Signal", f"Active Session Bearish Breakdown! Opening SHORT Qty: {QUANTITY}...")
                             order, avg_price = place_futures_order(SYMBOL, "SELL", QUANTITY)
 
                             if order and 'orderId' in order:
                                 last_traded_candle_time = current_candle_time
-                                time.sleep(2.5)  # MODIFIED: Increased delay for API position state sync
+                                time.sleep(2.5)  
                                 _, real_entry = get_position_info(SYMBOL)
                                 entry = real_entry if real_entry > 0 else (avg_price if avg_price > 0 else current_price)
 
@@ -486,7 +501,7 @@ def bot_loop():
                                 tp_price = entry - tp_distance
 
                                 place_stop_loss_and_take_profit(SYMBOL, "BUY", sl_price, tp_price, QUANTITY)
-                                notify("SHORT Executed", f"Entry: ${entry:,.2f} | SL: ${sl_price:,.2f} | TP: ${tp_price:,.2f}")
+                                notify("SHORT EXECUTED", f"Entry: ${entry:,.2f}\nSL: ${sl_price:,.2f}\nTP: ${tp_price:,.2f}")
 
         except Exception as e:
             print(f"\nLoop Error: {e}")
