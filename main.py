@@ -16,63 +16,61 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "XAUUSDT High-Volume Session Bot with Telegram Notifications & Controls is Running!"
+    return "XAUUSDT Multi-TF EMA Pullback Bot with Dynamic Session & Robust Execution is Running!"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# Self-Ping to prevent Render from sleeping
 def keep_alive():
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if render_url:
         while True:
             try:
-                requests.get(render_url, timeout=10)
+                requests.get(render_url, timeout=5)
                 print("\n Keep-alive ping sent to server.")
             except Exception as e:
                 print(f"\nPing Error: {e}")
             time.sleep(600)  # Every 10 minutes
 
 # ===================================================
-# API KEYS & CONFIGURATION (REAL ACCOUNT SETTINGS)
+# API KEYS & CONFIGURATION
 # ===================================================
 API_KEY = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_SECRET_KEY", "")
 
-# TELEGRAM CONFIGURATION
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Real Account Configuration
 USE_TESTNET = False  
-
 SYMBOL = "XAUUSDT"
-BASE_URL = "https://fapi.binance.com"  # Real Account Futures Endpoint
+BASE_URL = "https://fapi.binance.com"
 
-LEVERAGE = 20  # Set to your preferred leverage
-QUANTITY = 0.003  # Minimum safe quantity for XAUUSDT
+LEVERAGE = 20  
+QUANTITY = 0.005  
 
 CANDLE_TIMEFRAME = "15m"
-MACRO_TIMEFRAME = "1h"
-POLL_INTERVAL = 10 
+MACRO_TIMEFRAME_1H = "1h"
+MACRO_TIMEFRAME_4H = "4h"
+POLL_INTERVAL = 15  
 
-# RISK & STRATEGY SETTINGS
+# RISK & EMA STRATEGY SETTINGS
+EMA_FAST = 9
+EMA_SLOW = 21
+EMA_TREND = 200
+
 ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 1.5
 ATR_TP_MULTIPLIER = 3.0
 BE_ATR_MULTIPLIER = 2.0  
-BREAKOUT_BUFFER_PERCENT = 0.001  
-ADX_THRESHOLD = 25
-DONCHIAN_PERIOD = 20
 
-# SESSION TIME FILTER (UTC) - London & New York Active Trading Hours
-SESSION_START_HOUR_UTC = 7   # 07:00 UTC
-SESSION_END_HOUR_UTC = 21    # 21:00 UTC
+# ANTI-RANGE FILTERS
+ADX_THRESHOLD = 22  
+EMA_SPREAD_MIN_PERCENT = 0.0012  
 
-# GLOBAL CONTROL FLAGS FOR NEWS PAUSE SYSTEM
 BOT_PAUSED = False
 LAST_UPDATE_ID = 0
+IS_BE_ACTIVATED = False  # Track BE status per trade (Fix Point 1)
 
 # ===================================================
 # TELEGRAM FUNCTIONS & COMMAND CONTROL
@@ -81,10 +79,8 @@ def notify(title, message):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     formatted_msg = f"[{current_time}]\n🔔 *{title}*\n{message}"
     
-    # 1. Console Log
     print(f"\n{formatted_msg}")
     
-    # 2. Telegram Send
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -93,20 +89,19 @@ def notify(title, message):
                 "text": formatted_msg,
                 "parse_mode": "Markdown"
             }
-            requests.post(url, json=payload, timeout=5)
+            requests.post(url, json=payload, timeout=3)
         except Exception as e:
             print(f"Telegram Send Error: {e}")
 
 def check_telegram_commands():
-    """Listens for Telegram commands (/pause, /resume, /status) to control the bot."""
     global BOT_PAUSED, LAST_UPDATE_ID
     if not TELEGRAM_BOT_TOKEN:
         return
 
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-        params = {"offset": LAST_UPDATE_ID + 1, "timeout": 2}
-        res = requests.get(url, params=params, timeout=5).json()
+        params = {"offset": LAST_UPDATE_ID + 1, "timeout": 1}
+        res = requests.get(url, params=params, timeout=2).json()
 
         if res.get("ok") and res.get("result"):
             for update in res["result"]:
@@ -115,37 +110,49 @@ def check_telegram_commands():
                 text = message.get("text", "").strip().lower()
                 chat_id = str(message.get("chat", {}).get("id", ""))
 
-                # Security Check: Only process commands from your Telegram Chat ID
                 if chat_id == str(TELEGRAM_CHAT_ID):
                     if text == "/pause":
                         BOT_PAUSED = True
-                        notify("PAUSED ⏸️", "Bot trading has been *PAUSED* for News/Safety.")
+                        notify("PAUSED ⏸️", "Bot trading has been *PAUSED*.")
                     elif text in ["/resume", "/start"]:
                         BOT_PAUSED = False
                         notify("RESUMED ▶️", "Bot trading has been *RESUMED*.")
                     elif text == "/status":
                         status_str = "PAUSED ⏸️" if BOT_PAUSED else "RUNNING 🟢"
                         notify("STATUS 📊", f"Current Bot Status: *{status_str}*")
-    except Exception as e:
-        print(f"Telegram Command Check Error: {e}")
+    except Exception:
+        pass  
 
 # ===================================================
-# BINANCE UTILITIES & SIGNED REQUESTS
+# BINANCE UTILITIES & DYNAMIC SESSION FILTER (FIX POINT 7)
 # ===================================================
+def is_dst(dt):
+    """Check daylight saving time adjustment for UTC sessions"""
+    year = dt.year
+    # European DST: Last Sunday of March to Last Sunday of October
+    dst_start = datetime(year, 3, 31) - timedelta(days=(datetime(year, 3, 31).weekday() + 1) % 7)
+    dst_end = datetime(year, 10, 31) - timedelta(days=(datetime(year, 10, 31).weekday() + 1) % 7)
+    return dst_start.replace(tzinfo=timezone.utc) <= dt < dst_end.replace(tzinfo=timezone.utc)
+
 def is_high_volume_session():
-    """Checks if current UTC time falls within London / New York high-volume hours on weekdays."""
     now_utc = datetime.now(timezone.utc)
-    if now_utc.weekday() in [5, 6]:
+    if now_utc.weekday() in [5, 6]:  # Weekend check
         return False
-    return SESSION_START_HOUR_UTC <= now_utc.hour < SESSION_END_HOUR_UTC
+    
+    # Dynamic UTC adjustment based on DST
+    if is_dst(now_utc):
+        session_start, session_end = 6, 20  # Summer UTC hours
+    else:
+        session_start, session_end = 7, 21  # Winter UTC hours
+
+    return session_start <= now_utc.hour < session_end
 
 def send_signed_request(http_method, url_path, payload=None):
     if not API_KEY or not API_SECRET:
         print("\n❌ ERROR: BINANCE_API_KEY or BINANCE_SECRET_KEY is missing!")
         return None
 
-    if payload is None:
-        payload = {}
+    if payload is None: payload = {}
     try:
         query_string = urllib.parse.urlencode(payload)
         timestamp = int(time.time() * 1000)
@@ -161,11 +168,11 @@ def send_signed_request(http_method, url_path, payload=None):
         headers = {"X-MBX-APIKEY": API_KEY}
 
         if http_method == "POST":
-            res = requests.post(full_url, headers=headers, timeout=10)
+            res = requests.post(full_url, headers=headers, timeout=5)
         elif http_method == "DELETE":
-            res = requests.delete(full_url, headers=headers, timeout=10)
+            res = requests.delete(full_url, headers=headers, timeout=5)
         else:
-            res = requests.get(full_url, headers=headers, timeout=10)
+            res = requests.get(full_url, headers=headers, timeout=5)
 
         if res.status_code == 200:
             return res.json()
@@ -210,7 +217,7 @@ def round_step(value, step):
     return round(math.floor(float(value) * factor) / factor, precision)
 
 # ===================================================
-# ACCOUNT & POSITION MANAGEMENT
+# ACCOUNT & POSITION MANAGEMENT (FIX POINT 2)
 # ===================================================
 def ensure_one_way_mode():
     path = "/fapi/v1/positionSide/dual"
@@ -223,13 +230,16 @@ def set_leverage(symbol, leverage):
     payload = {"symbol": symbol, "leverage": leverage}
     return send_signed_request("POST", path, payload)
 
-def get_position_info(symbol):
+def get_position_info(symbol, retries=3):
+    """Robust Position Fetching with Retries for Slow Networks (Fix Point 2)"""
     path = "/fapi/v2/positionRisk"
-    res = send_signed_request("GET", path, {"symbol": symbol})
-    if res and isinstance(res, list):
-        for pos in res:
-            if pos['symbol'] == symbol:
-                return float(pos['positionAmt']), float(pos['entryPrice'])
+    for attempt in range(retries):
+        res = send_signed_request("GET", path, {"symbol": symbol})
+        if res and isinstance(res, list):
+            for pos in res:
+                if pos['symbol'] == symbol:
+                    return float(pos['positionAmt']), float(pos['entryPrice'])
+        time.sleep(0.5)
     return None, 0.0
 
 def check_if_sl_is_at_breakeven(symbol, entry_price):
@@ -244,7 +254,7 @@ def check_if_sl_is_at_breakeven(symbol, entry_price):
     return False
 
 # ===================================================
-# ORDERS & BREAK-EVEN SYSTEM
+# ORDERS & EMERGENCY SYSTEM (FIX POINT 3)
 # ===================================================
 def cancel_all_orders(symbol):
     path = "/fapi/v1/allOpenOrders"
@@ -252,6 +262,7 @@ def cancel_all_orders(symbol):
     return send_signed_request("DELETE", path, payload)
 
 def emergency_close_position(symbol, current_position_side, quantity):
+    """Guaranteed Multi-Retry Emergency Close (Fix Point 3)"""
     path = "/fapi/v1/order"
     close_side = "SELL" if current_position_side.upper() in ["BUY", "LONG"] else "BUY"
     payload = {
@@ -261,8 +272,17 @@ def emergency_close_position(symbol, current_position_side, quantity):
         "quantity": f"{round_step(quantity, STEP_SIZE)}",
         "reduceOnly": "true"
     }
-    notify("EMERGENCY CLOSE", f"Closing {current_position_side} position immediately with {close_side} order!")
-    return send_signed_request("POST", path, payload)
+    notify("EMERGENCY CLOSE", f"Closing {current_position_side} position immediately!")
+    
+    # Retry loop up to 5 times if network fails
+    for i in range(5):
+        res = send_signed_request("POST", path, payload)
+        if res and 'orderId' in res:
+            return True
+        time.sleep(1)
+    
+    notify("CRITICAL ALERT 🚨", "EMERGENCY MARKET CLOSE FAILED MULTIPLE TIMES! Check Account manually.")
+    return False
 
 def place_futures_order(symbol, side, quantity):
     path = "/fapi/v1/order"
@@ -303,11 +323,7 @@ def place_stop_loss_and_take_profit(symbol, exit_side, sl_price, tp_price, qty):
     }
     tp_res = send_signed_request("POST", path, tp_payload)
 
-    sl_ok = sl_res and 'orderId' in sl_res
-    tp_ok = tp_res and 'orderId' in tp_res
-
-    if not (sl_ok and tp_ok):
-        notify("CRITICAL ERROR", "SL or TP placement failed! Executing emergency close for safety.")
+    if not (sl_res and 'orderId' in sl_res and tp_res and 'orderId' in tp_res):
         pos_side = "LONG" if exit_side == "SELL" else "SHORT"
         emergency_close_position(symbol, pos_side, qty)
         return False
@@ -316,10 +332,8 @@ def place_stop_loss_and_take_profit(symbol, exit_side, sl_price, tp_price, qty):
 def update_break_even_sl(symbol, exit_side, entry_price, tp_price, qty, current_price):
     min_dist = TICK_SIZE * 10
     if exit_side == "SELL" and (current_price - entry_price) < min_dist:
-        notify("BE WARNING", "Price too close to Entry. Skipping Break-Even update.")
         return False
     elif exit_side == "BUY" and (entry_price - current_price) < min_dist:
-        notify("BE WARNING", "Price too close to Entry. Skipping Break-Even update.")
         return False
 
     return place_stop_loss_and_take_profit(symbol, exit_side, entry_price, tp_price, qty)
@@ -343,20 +357,19 @@ def get_klines_data(symbol, interval, limit=250):
         print(f"Candle Fetch Error ({interval}): {e}")
     return None, None, None, None, None
 
-def calculate_ema(prices, period):
-    if len(prices) < period: return 0.0
+def calculate_ema_series(prices, period):
+    if len(prices) < period: return [0.0] * len(prices)
     k = 2 / (period + 1)
-    ema = sum(prices[:period]) / period
+    ema_list = [sum(prices[:period]) / period]
     for price in prices[period:]:
-        ema = (price * k) + (ema * (1 - k))
-    return ema
+        ema_list.append((price * k) + (ema_list[-1] * (1 - k)))
+    return [0.0] * (period - 1) + ema_list
 
 def _wilders_rma(values, period):
     if len(values) < period: return [0.0] * len(values)
     rma = [sum(values[:period]) / period]
     for val in values[period:]:
-        new_rma = (rma[-1] * (period - 1) + val) / period
-        rma.append(new_rma)
+        rma.append((rma[-1] * (period - 1) + val) / period)
     return rma
 
 def calculate_atr(highs, lows, closes, period=14):
@@ -376,10 +389,8 @@ def calculate_adx(highs, lows, closes, period=14):
         tr_list.append(tr)
         up_move = highs[i] - highs[i-1]
         down_move = lows[i-1] - lows[i]
-        pdm = up_move if (up_move > down_move and up_move > 0) else 0.0
-        mdm = down_move if (down_move > up_move and down_move > 0) else 0.0
-        pdm_list.append(pdm)
-        mdm_list.append(mdm)
+        pdm_list.append(up_move if (up_move > down_move and up_move > 0) else 0.0)
+        mdm_list.append(down_move if (down_move > up_move and down_move > 0) else 0.0)
 
     tr_rma = _wilders_rma(tr_list, period)
     pdm_rma = _wilders_rma(pdm_list, period)
@@ -391,8 +402,7 @@ def calculate_adx(highs, lows, closes, period=14):
         pdi = (pdm_rma[i] / tr_rma[i]) * 100
         mdi = (mdm_rma[i] / tr_rma[i]) * 100
         di_sum = pdi + mdi
-        dx = (abs(pdi - mdi) / di_sum * 100) if di_sum != 0 else 0.0
-        dx_list.append(dx)
+        dx_list.append((abs(pdi - mdi) / di_sum * 100) if di_sum != 0 else 0.0)
 
     if len(dx_list) < period: return 0.0
     adx_rma = _wilders_rma(dx_list, period)
@@ -428,8 +438,8 @@ def calculate_stoch_rsi(closes, period=14, stoch_period=14):
 # BOT MAIN LOOP
 # ===================================================
 def bot_loop():
-    global TICK_SIZE, STEP_SIZE
-    notify("SYSTEM STARTUP", f"Bot Initialized for {SYMBOL} ({CANDLE_TIMEFRAME}) | Leverage: {LEVERAGE}x | Qty: {QUANTITY}\n\n_Use /pause, /resume, or /status in Telegram to control the bot._")
+    global TICK_SIZE, STEP_SIZE, IS_BE_ACTIVATED
+    notify("SYSTEM STARTUP", f"Bot Initialized for {SYMBOL} with Dynamic Sessions & Enhanced Risk Management.")
     
     ensure_one_way_mode()
     set_leverage(SYMBOL, LEVERAGE)
@@ -440,10 +450,8 @@ def bot_loop():
 
     while True:
         try:
-            # 1. Telegram വഴി കമാൻഡുകൾ ഉണ്ടോ എന്ന് ചെക്ക് ചെയ്യുക (/pause, /resume, /status)
             check_telegram_commands()
 
-            # 2. ബോട്ട് PAUSED ആണെങ്കിൽ പുതിയ അനാലിസിസിലേക്ക് കടക്കാതെ വെയിറ്റ് ചെയ്യും
             if BOT_PAUSED:
                 print("Bot status: PAUSED (Waiting for /resume command...)", end="\r")
                 time.sleep(POLL_INTERVAL)
@@ -457,26 +465,41 @@ def bot_loop():
 
             if actual_pos == 0 and was_in_position:
                 cancel_all_orders(SYMBOL)
-                notify("POSITION CLOSED", "Position closed via TP/SL. Orders cleaned up safely.")
+                notify("POSITION CLOSED", "Position closed via TP/SL. Resetting Risk States.")
                 was_in_position = False
+                IS_BE_ACTIVATED = False  # Reset BE State (Fix Point 1)
 
             if actual_pos != 0:
                 was_in_position = True
 
             timestamps, closes, highs, lows, volumes = get_klines_data(SYMBOL, CANDLE_TIMEFRAME, limit=250)
-            _, macro_closes, _, _, _ = get_klines_data(SYMBOL, MACRO_TIMEFRAME, limit=250)
+            _, macro_closes_1h, _, _, _ = get_klines_data(SYMBOL, MACRO_TIMEFRAME_1H, limit=250)
+            _, macro_closes_4h, _, _, _ = get_klines_data(SYMBOL, MACRO_TIMEFRAME_4H, limit=250)
 
-            if (closes is not None and macro_closes is not None and 
-                len(closes) >= 200 and len(macro_closes) >= 200):
+            if (closes is not None and macro_closes_1h is not None and macro_closes_4h is not None and 
+                len(closes) >= 200 and len(macro_closes_1h) >= 200 and len(macro_closes_4h) >= 200):
                 
                 current_candle_time = timestamps[-2]
                 last_closed_price = closes[-2]
                 current_price = closes[-1]
 
-                # Indicators
-                ema_200_15m = calculate_ema(closes[:-1], 200)
-                ema_200_1h = calculate_ema(macro_closes[:-1], 200)
+                # --- INDICATOR CALCULATIONS ---
+                ema_9_series = calculate_ema_series(closes[:-1], EMA_FAST)
+                ema_21_series = calculate_ema_series(closes[:-1], EMA_SLOW)
+                ema_200_15m_series = calculate_ema_series(closes[:-1], EMA_TREND)
                 
+                ema_200_1h_series = calculate_ema_series(macro_closes_1h[:-1], EMA_TREND)
+                ema_200_4h_series = calculate_ema_series(macro_closes_4h[:-1], EMA_TREND)
+
+                ema_9_last = ema_9_series[-1]
+                ema_21_last = ema_21_series[-1]
+                ema_200_15m_last = ema_200_15m_series[-1]
+                ema_200_1h_last = ema_200_1h_series[-1]
+                ema_200_4h_last = ema_200_4h_series[-1]
+
+                low_last = lows[-2]
+                high_last = highs[-2]
+
                 adx_val = calculate_adx(highs[:-1], lows[:-1], closes[:-1], ATR_PERIOD)
                 stoch_rsi = calculate_stoch_rsi(closes[:-1])
                 atr_val = calculate_atr(highs[:-1], lows[:-1], closes[:-1], ATR_PERIOD)
@@ -484,74 +507,77 @@ def bot_loop():
                 last_vol = volumes[-2]
                 vol_ma = sum(volumes[-21:-1]) / 20
 
-                # Donchian Level System
-                donchian_high = max(highs[-(DONCHIAN_PERIOD + 1): -1])
-                donchian_low = min(lows[-(DONCHIAN_PERIOD + 1): -1])
-
-                donchian_high_buffered = donchian_high * (1 + BREAKOUT_BUFFER_PERCENT)
-                donchian_low_buffered = donchian_low * (1 - BREAKOUT_BUFFER_PERCENT)
-
                 session_active = is_high_volume_session()
-                print(f"Price: ${current_price:,.2f} | ADX: {adx_val:.1f} | Active Session: {session_active} | Active Qty: {actual_pos}", end="\r")
 
-                # BREAK-EVEN STOP LOSS MANAGEMENT
-                if actual_pos != 0 and current_entry_price > 0:
-                    is_sl_moved_to_be = check_if_sl_is_at_breakeven(SYMBOL, current_entry_price)
+                # --- ANTI-SIDEWAYS / RANGE FILTERS ---
+                ema_spread = abs(ema_9_last - ema_21_last) / last_closed_price
+                is_market_trending = ema_spread >= EMA_SPREAD_MIN_PERCENT
+
+                print(f"Price: ${current_price:,.2f} | ADX: {adx_val:.1f} | EMA Spread: {ema_spread*100:.3f}% | Position: {actual_pos}", end="\r")
+
+                # BREAK-EVEN STOP LOSS MANAGEMENT (FIX POINT 1)
+                if actual_pos != 0 and current_entry_price > 0 and not IS_BE_ACTIVATED:
+                    profit_distance = (current_price - current_entry_price) if actual_pos > 0 else (current_entry_price - current_price)
+                    if profit_distance >= (atr_val * BE_ATR_MULTIPLIER):
+                        close_side = "SELL" if actual_pos > 0 else "BUY"
+                        new_tp = current_entry_price + (atr_val * ATR_TP_MULTIPLIER) if actual_pos > 0 else current_entry_price - (atr_val * ATR_TP_MULTIPLIER)
+                        
+                        success = update_break_even_sl(
+                            SYMBOL, close_side, current_entry_price, new_tp, abs(actual_pos), current_price
+                        )
+                        if success:
+                            IS_BE_ACTIVATED = True  # Avoid infinite loop & spam
+                            notify("RISK UPDATE", f"Profit target reached! SL moved to Break-Even (${current_entry_price:,.2f}).")
+
+                # ===================================================
+                # ENTRY CONDITIONS WITH SAFE RETRIES
+                # ===================================================
+                if (actual_pos == 0 and adx_val >= ADX_THRESHOLD and 
+                    is_market_trending and last_traded_candle_time != current_candle_time):
                     
-                    if not is_sl_moved_to_be:
-                        profit_distance = (current_price - current_entry_price) if actual_pos > 0 else (current_entry_price - current_price)
-                        if profit_distance >= (atr_val * BE_ATR_MULTIPLIER):
-                            close_side = "SELL" if actual_pos > 0 else "BUY"
-                            new_tp = current_entry_price + (atr_val * ATR_TP_MULTIPLIER) if actual_pos > 0 else current_entry_price - (atr_val * ATR_TP_MULTIPLIER)
-                            
-                            success = update_break_even_sl(
-                                SYMBOL, 
-                                close_side, 
-                                current_entry_price, 
-                                new_tp, 
-                                abs(actual_pos),
-                                current_price
-                            )
-                            if success:
-                                notify("RISK UPDATE", f"Profit target reached! SL moved to Break-Even (${current_entry_price:,.2f}) safely.")
-
-                # ENTRY CONDITIONS WITH SESSION FILTER
-                if actual_pos == 0 and adx_val >= ADX_THRESHOLD and last_traded_candle_time != current_candle_time:
                     if session_active and last_vol > vol_ma:
                         sl_distance = atr_val * ATR_SL_MULTIPLIER
                         tp_distance = atr_val * ATR_TP_MULTIPLIER
 
-                        # LONG ENTRY
-                        if last_closed_price > donchian_high_buffered and last_closed_price > ema_200_15m and last_closed_price > ema_200_1h and stoch_rsi < 80:
+                        # 1. LONG ENTRY LOGIC
+                        macro_uptrend = (last_closed_price > ema_200_4h_last) and (last_closed_price > ema_200_1h_last) and (last_closed_price > ema_200_15m_last)
+                        ema_aligned_long = ema_9_last > ema_21_last
+                        pulled_back_long = low_last <= max(ema_9_last, ema_21_last) and last_closed_price > ema_21_last
+
+                        if macro_uptrend and ema_aligned_long and pulled_back_long and stoch_rsi < 70:
                             order, avg_price = place_futures_order(SYMBOL, "BUY", QUANTITY)
 
                             if order and 'orderId' in order:
                                 last_traded_candle_time = current_candle_time
-                                time.sleep(2.5)  
-                                _, real_entry = get_position_info(SYMBOL)
+                                # Fetch position with retry mechanism (Fix Point 2)
+                                _, real_entry = get_position_info(SYMBOL, retries=3)
                                 entry = real_entry if real_entry > 0 else (avg_price if avg_price > 0 else current_price)
                                 
                                 sl_price = entry - sl_distance
                                 tp_price = entry + tp_distance
 
                                 place_stop_loss_and_take_profit(SYMBOL, "SELL", sl_price, tp_price, QUANTITY)
-                                notify("LONG EXECUTED", f"Entry: ${entry:,.2f}\nSL: ${sl_price:,.2f}\nTP: ${tp_price:,.2f}")
+                                notify("EMA PULLBACK LONG", f"Entry: ${entry:,.2f}\nSL: ${sl_price:,.2f}\nTP: ${tp_price:,.2f}")
 
-                        # SHORT ENTRY
-                        elif last_closed_price < donchian_low_buffered and last_closed_price < ema_200_15m and last_closed_price < ema_200_1h and stoch_rsi > 20:
+                        # 2. SHORT ENTRY LOGIC
+                        macro_downtrend = (last_closed_price < ema_200_4h_last) and (last_closed_price < ema_200_1h_last) and (last_closed_price < ema_200_15m_last)
+                        ema_aligned_short = ema_9_last < ema_21_last
+                        pulled_back_short = high_last >= min(ema_9_last, ema_21_last) and last_closed_price < ema_21_last
+
+                        if macro_downtrend and ema_aligned_short and pulled_back_short and stoch_rsi > 30:
                             order, avg_price = place_futures_order(SYMBOL, "SELL", QUANTITY)
 
                             if order and 'orderId' in order:
                                 last_traded_candle_time = current_candle_time
-                                time.sleep(2.5)  
-                                _, real_entry = get_position_info(SYMBOL)
+                                # Fetch position with retry mechanism (Fix Point 2)
+                                _, real_entry = get_position_info(SYMBOL, retries=3)
                                 entry = real_entry if real_entry > 0 else (avg_price if avg_price > 0 else current_price)
 
                                 sl_price = entry + sl_distance
                                 tp_price = entry - tp_distance
 
                                 place_stop_loss_and_take_profit(SYMBOL, "BUY", sl_price, tp_price, QUANTITY)
-                                notify("SHORT EXECUTED", f"Entry: ${entry:,.2f}\nSL: ${sl_price:,.2f}\nTP: ${tp_price:,.2f}")
+                                notify("EMA PULLBACK SHORT", f"Entry: ${entry:,.2f}\nSL: ${sl_price:,.2f}\nTP: ${tp_price:,.2f}")
 
         except Exception as e:
             print(f"\nLoop Error: {e}")
