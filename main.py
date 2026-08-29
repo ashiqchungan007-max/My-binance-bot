@@ -6,8 +6,6 @@ import time
 import urllib.parse
 from datetime import datetime, timezone, timedelta
 import requests
-import pandas as pd
-import pandas_ta as ta
 
 # ===================================================
 # API KEYS & CONFIGURATION
@@ -214,6 +212,20 @@ def get_position_info(symbol, retries=3):
         time.sleep(0.5)
     return None, 0.0
 
+def check_if_sl_is_at_breakeven(symbol, entry_price):
+    path = "/fapi/v1/openOrders"
+    res = send_signed_request("GET", path, {"symbol": symbol})
+    if res and isinstance(res, list):
+        for order in res:
+            if order.get("type") == "STOP_MARKET":
+                stop_price = float(order.get("stopPrice", 0.0))
+                if abs(stop_price - entry_price) < (TICK_SIZE * 5):
+                    return True
+    return False
+
+# ===================================================
+# ORDERS & EMERGENCY SYSTEM
+# ===================================================
 def cancel_all_orders(symbol):
     path = "/fapi/v1/allOpenOrders"
     payload = {"symbol": symbol}
@@ -295,7 +307,7 @@ def update_break_even_sl(symbol, exit_side, entry_price, tp_price, qty, current_
     return place_stop_loss_and_take_profit(symbol, exit_side, entry_price, tp_price, qty)
 
 # ===================================================
-# KLINES & PANDAS-TA INDICATORS
+# KLINES & INDICATORS
 # ===================================================
 def get_klines_data(symbol, interval, limit=250):
     try:
@@ -313,36 +325,89 @@ def get_klines_data(symbol, interval, limit=250):
         print(f"Candle Fetch Error ({interval}): {e}")
     return None, None, None, None, None
 
-def get_df_with_indicators(highs, lows, closes, volumes):
-    df = pd.DataFrame({
-        'high': highs,
-        'low': lows,
-        'close': closes,
-        'volume': volumes
-    })
+def calculate_ema_series(prices, period):
+    if len(prices) < period: return [0.0] * len(prices)
+    k = 2 / (period + 1)
+    ema_list = [sum(prices[:period]) / period]
+    for price in prices[period:]:
+        ema_list.append((price * k) + (ema_list[-1] * (1 - k)))
+    return [0.0] * (period - 1) + ema_list
 
-    df['ema_9'] = ta.ema(df['close'], length=EMA_FAST)
-    df['ema_21'] = ta.ema(df['close'], length=EMA_SLOW)
-    df['ema_200'] = ta.ema(df['close'], length=EMA_TREND)
-    
-    df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=ATR_PERIOD)
-    
-    adx_df = ta.adx(df['high'], df['low'], df['close'], length=ATR_PERIOD)
-    df['adx'] = adx_df[f'ADX_{ATR_PERIOD}']
-    
-    stoch_rsi_df = ta.stochrsi(df['close'], length=14, rsi_length=14, k=3, d=3)
-    df['stoch_rsi'] = stoch_rsi_df['STOCHRSIk_14_14_3_3']
-    
-    df['vol_ma'] = df['volume'].rolling(window=20).mean()
+def _wilders_rma(values, period):
+    if len(values) < period: return [0.0] * len(values)
+    rma = [sum(values[:period]) / period]
+    for val in values[period:]:
+        rma.append((rma[-1] * (period - 1) + val) / period)
+    return rma
 
-    return df
+def calculate_atr(highs, lows, closes, period=14):
+    if len(closes) <= period: return 2.0
+    tr_list = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        tr_list.append(tr)
+    atr_series = _wilders_rma(tr_list, period)
+    return atr_series[-1]
+
+def calculate_adx(highs, lows, closes, period=14):
+    if len(closes) <= (period * 2): return 0.0
+    tr_list, pdm_list, mdm_list = [], [], []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        tr_list.append(tr)
+        up_move = highs[i] - highs[i-1]
+        down_move = lows[i-1] - lows[i]
+        pdm_list.append(up_move if (up_move > down_move and up_move > 0) else 0.0)
+        mdm_list.append(down_move if (down_move > up_move and down_move > 0) else 0.0)
+
+    tr_rma = _wilders_rma(tr_list, period)
+    pdm_rma = _wilders_rma(pdm_list, period)
+    mdm_rma = _wilders_rma(mdm_list, period)
+
+    dx_list = []
+    for i in range(len(tr_rma)):
+        if tr_rma[i] == 0: continue
+        pdi = (pdm_rma[i] / tr_rma[i]) * 100
+        mdi = (mdm_rma[i] / tr_rma[i]) * 100
+        di_sum = pdi + mdi
+        dx_list.append((abs(pdi - mdi) / di_sum * 100) if di_sum != 0 else 0.0)
+
+    if len(dx_list) < period: return 0.0
+    adx_rma = _wilders_rma(dx_list, period)
+    return adx_rma[-1]
+
+def calculate_stoch_rsi(closes, period=14, stoch_period=14):
+    if len(closes) < (period + stoch_period + 5): return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i-1]
+        gains.append(max(change, 0.0))
+        losses.append(abs(min(change, 0.0)))
+
+    avg_gains = _wilders_rma(gains, period)
+    avg_losses = _wilders_rma(losses, period)
+
+    rsi_list = []
+    for i in range(len(avg_gains)):
+        if avg_losses[i] == 0:
+            rsi_list.append(100.0)
+        else:
+            rs = avg_gains[i] / avg_losses[i]
+            rsi_list.append(100.0 - (100.0 / (1.0 + rs)))
+
+    if len(rsi_list) < stoch_period: return 50.0
+    recent_rsi = rsi_list[-stoch_period:]
+    min_rsi, max_rsi = min(recent_rsi), max(recent_rsi)
+    if max_rsi == min_rsi: return 50.0
+
+    return ((rsi_list[-1] - min_rsi) / (max_rsi - min_rsi)) * 100.0
 
 # ===================================================
 # BOT MAIN LOOP
 # ===================================================
 def bot_loop():
     global TICK_SIZE, STEP_SIZE, IS_BE_ACTIVATED
-    notify("SYSTEM STARTUP", f"Bot Initialized for {SYMBOL} on Oracle Cloud VPS (Pandas Powered).")
+    notify("SYSTEM STARTUP", f"Bot Initialized for {SYMBOL} on Oracle Cloud VPS.")
     
     ensure_one_way_mode()
     set_leverage(SYMBOL, LEVERAGE)
@@ -386,27 +451,28 @@ def bot_loop():
                 last_closed_price = closes[-2]
                 current_price = closes[-1]
 
-                # Pandas Indicators calculation
-                df_15m = get_df_with_indicators(highs[:-1], lows[:-1], closes[:-1], volumes[:-1])
+                ema_9_series = calculate_ema_series(closes[:-1], EMA_FAST)
+                ema_21_series = calculate_ema_series(closes[:-1], EMA_SLOW)
+                ema_200_15m_series = calculate_ema_series(closes[:-1], EMA_TREND)
                 
-                ema_200_1h_last = ta.ema(pd.Series(macro_closes_1h[:-1]), length=EMA_TREND).iloc[-1]
-                ema_200_4h_last = ta.ema(pd.Series(macro_closes_4h[:-1]), length=EMA_TREND).iloc[-1]
+                ema_200_1h_series = calculate_ema_series(macro_closes_1h[:-1], EMA_TREND)
+                ema_200_4h_series = calculate_ema_series(macro_closes_4h[:-1], EMA_TREND)
 
-                last_row = df_15m.iloc[-1]
-
-                ema_9_last = last_row['ema_9']
-                ema_21_last = last_row['ema_21']
-                ema_200_15m_last = last_row['ema_200']
-                
-                adx_val = last_row['adx']
-                atr_val = last_row['atr']
-                stoch_rsi = last_row['stoch_rsi']
-                
-                last_vol = last_row['volume']
-                vol_ma = last_row['vol_ma']
+                ema_9_last = ema_9_series[-1]
+                ema_21_last = ema_21_series[-1]
+                ema_200_15m_last = ema_200_15m_series[-1]
+                ema_200_1h_last = ema_200_1h_series[-1]
+                ema_200_4h_last = ema_200_4h_series[-1]
 
                 low_last = lows[-2]
                 high_last = highs[-2]
+
+                adx_val = calculate_adx(highs[:-1], lows[:-1], closes[:-1], ATR_PERIOD)
+                stoch_rsi = calculate_stoch_rsi(closes[:-1])
+                atr_val = calculate_atr(highs[:-1], lows[:-1], closes[:-1], ATR_PERIOD)
+
+                last_vol = volumes[-2]
+                vol_ma = sum(volumes[-21:-1]) / 20
 
                 session_active = is_high_volume_session()
 
@@ -482,3 +548,5 @@ def bot_loop():
 
 if __name__ == "__main__":
     bot_loop()
+
+
