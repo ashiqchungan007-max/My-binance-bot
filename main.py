@@ -46,6 +46,27 @@ BOT_PAUSED = False
 LAST_UPDATE_ID = 0
 IS_BE_ACTIVATED = False
 
+TIME_OFFSET = 0
+
+# ===================================================
+# TIME SYNC WITH BINANCE SERVER
+# ===================================================
+def sync_time_with_binance():
+    global TIME_OFFSET
+    try:
+        url = f"{BASE_URL}/fapi/v1/time"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            server_time = res.json().get("serverTime", 0)
+            local_time = int(time.time() * 1000)
+            TIME_OFFSET = server_time - local_time
+            print(f"🕒 Time synchronized with Binance. Offset: {TIME_OFFSET} ms")
+    except Exception as e:
+        print(f"⚠️ Time Sync Error: {e}")
+
+def get_corrected_timestamp():
+    return int(time.time() * 1000) + TIME_OFFSET
+
 # ===================================================
 # TELEGRAM FUNCTIONS & COMMAND CONTROL
 # ===================================================
@@ -126,7 +147,7 @@ def send_signed_request(http_method, url_path, payload=None):
     if payload is None: payload = {}
     try:
         query_string = urllib.parse.urlencode(payload)
-        timestamp = int(time.time() * 1000)
+        timestamp = get_corrected_timestamp()
         query_string += f"&timestamp={timestamp}" if query_string else f"timestamp={timestamp}"
 
         signature = hmac.new(
@@ -152,6 +173,9 @@ def send_signed_request(http_method, url_path, payload=None):
             time.sleep(30)
             return None
         else:
+            # If timestamp error occurs, re-sync time once
+            if "timestamp" in res.text.lower() or "-1021" in res.text:
+                sync_time_with_binance()
             print(f"\n⚠️ Binance API Error ({res.status_code}): {res.text}")
             return None
     except Exception as e:
@@ -211,17 +235,6 @@ def get_position_info(symbol, retries=3):
                     return float(pos['positionAmt']), float(pos['entryPrice'])
         time.sleep(0.5)
     return None, 0.0
-
-def check_if_sl_is_at_breakeven(symbol, entry_price):
-    path = "/fapi/v1/openOrders"
-    res = send_signed_request("GET", path, {"symbol": symbol})
-    if res and isinstance(res, list):
-        for order in res:
-            if order.get("type") == "STOP_MARKET":
-                stop_price = float(order.get("stopPrice", 0.0))
-                if abs(stop_price - entry_price) < (TICK_SIZE * 5):
-                    return True
-    return False
 
 # ===================================================
 # ORDERS & EMERGENCY SYSTEM
@@ -407,6 +420,10 @@ def calculate_stoch_rsi(closes, period=14, stoch_period=14):
 # ===================================================
 def bot_loop():
     global TICK_SIZE, STEP_SIZE, IS_BE_ACTIVATED
+    
+    # Sync time on startup
+    sync_time_with_binance()
+    
     notify("SYSTEM STARTUP", f"Bot Initialized for {SYMBOL} on Oracle Cloud VPS.")
     
     ensure_one_way_mode()
@@ -415,9 +432,16 @@ def bot_loop():
 
     was_in_position = False
     last_traded_candle_time = None
+    loop_counter = 0
 
     while True:
         try:
+            # Re-sync time every ~1 hour (240 loops * 15s) to prevent drift
+            loop_counter += 1
+            if loop_counter >= 240:
+                sync_time_with_binance()
+                loop_counter = 0
+
             check_telegram_commands()
 
             if BOT_PAUSED:
@@ -542,11 +566,3 @@ def bot_loop():
                                 notify("EMA PULLBACK SHORT", f"Entry: ${entry:,.2f}\nSL: ${sl_price:,.2f}\nTP: ${tp_price:,.2f}")
 
         except Exception as e:
-            print(f"\nLoop Error: {e}")
-
-        time.sleep(POLL_INTERVAL)
-
-if __name__ == "__main__":
-    bot_loop()
-
-
